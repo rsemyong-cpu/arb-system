@@ -62,6 +62,25 @@ class RepairEngine:
 
         book = self._books.get(exch, group.symbol)
         ref = (book.best_bid if side == Side.SELL else book.best_ask) if book else None
+        # Apply an aggressive IOC price buffer so the repair order actually
+        # crosses the book. Without this, ref == exact best_bid/ask, and by
+        # the time the order hits the exchange (50-200 ms later) the book
+        # has almost certainly ticked away — the IOC cancels with 0 fill,
+        # leaving a net-imbalance position that can only be cleared by the
+        # next repair attempt. With max_repair_attempts=3 we typically
+        # exhaust retries and land in ABORTED state with an unhedged leg.
+        # The buffer reuses ``ioc_price_buffer_bps`` (same knob used by
+        # the main hedge coordinator for its IOC legs); for repairs we want
+        # to pay slightly more to GUARANTEE fill, since the goal is to
+        # close an open imbalance, not to capture edge.
+        if ref is not None and ref > 0:
+            buffer = self._settings.ioc_price_buffer_bps / Decimal("10000")
+            if side == Side.SELL:
+                # Willing to sell below best_bid to ensure the bid side fills us
+                ref = ref * (Decimal(1) - buffer)
+            else:
+                # Willing to buy above best_ask to ensure the ask side fills us
+                ref = ref * (Decimal(1) + buffer)
         intent = OrderIntent(
             hedge_group_id=group.hedge_group_id,
             exchange=exch,

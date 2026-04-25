@@ -184,10 +184,14 @@ class OpportunityScanner:
 
     def _probe_size(self, symbol: str, buy_book, sell_book) -> Decimal:
         """
-        Start from a small probe size tied to max_notional_per_trade and go from there.
+        Probe size for VWAP evaluation. Must match the max notional the risk
+        engine may approve (``max_notional_per_trade``), otherwise we estimate
+        slippage at depth N but actually fill at depth M > N, which silently
+        turns positive-edge opportunities into loss-making fills on thin
+        small-cap books (PEPE / BONK / FLOKI / SHIB etc. where levels 2-5
+        can span tens of bps).
         """
         mid = buy_book.mid_price or Decimal(1)
         if mid == 0:
             mid = Decimal(1)
-        probe_quote = min(self._settings.max_notional_per_trade, Decimal("200"))
-        return probe_quote / mid
+        return self._settings.max_notional_per_trade / mid

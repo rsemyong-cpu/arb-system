@@ -27,9 +27,14 @@ from app.models.orderbook import OrderBookLevel, OrderBookSnapshot
 
 log = get_logger("adapter.ccxt")
 
-# Shallow book is enough for size-probing at MVP notionals and keeps Binance's
-# weight low (limit<=5 is weight 1 for spot depth). Raising this has cost.
-_ORDERBOOK_DEPTH = 5
+# Orderbook depth used by the REST fallback. With probe sizes now matching
+# ``max_notional_per_trade`` (up to 400 USDT default), 5 levels is often not
+# enough to fill the probe on thin small-cap books — VWAP gets truncated and
+# reports an artificially low max_tradable_base, making the risk engine cap
+# trades far below what the market actually offers. 10 is the sweet spot:
+# Binance/OKX/Bybit/Gate/Bitget/HTX all treat limit=10 as weight=1 (same as
+# limit=5), so no rate-limit impact.
+_ORDERBOOK_DEPTH = 10
 # Some exchanges reject small limits on fetchOrderBook. Known per-exchange
 # minimum accepted limits (ccxt raises ``ExchangeError`` if below):
 #   KuCoin     : must be 20 or 100
