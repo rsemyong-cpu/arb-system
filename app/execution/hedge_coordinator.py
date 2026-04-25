@@ -20,6 +20,7 @@ from app.execution.order_router import OrderRouter
 from app.execution.order_tracker import OrderTracker
 from app.execution.repair_engine import RepairEngine
 from app.execution.state_machine import HedgeStateMachine
+from app.marketdata.orderbook_manager import OrderBookManager
 from app.models.hedge import HedgeGroupState
 from app.models.opportunity import ArbitrageOpportunity
 from app.models.order import OrderIntent, UnifiedOrderState
@@ -47,6 +48,7 @@ class HedgeCoordinator:
         exposure: ExposureManager,
         breaker: CircuitBreaker | None = None,
         registry: AdapterRegistry | None = None,
+        book_mgr: OrderBookManager | None = None,
     ):
         self._settings = settings
         self._router = router
@@ -55,6 +57,11 @@ class HedgeCoordinator:
         self._exposure = exposure
         self._breaker = breaker
         self._registry = registry
+        # OrderBookManager is optional so legacy tests that don't care about
+        # pre-submit revalidation still construct cleanly. In production the
+        # bootstrap wires it in and we re-check prices immediately before
+        # submitting both legs (see ``execute``).
+        self._books = book_mgr
         self._hedges: dict[str, HedgeGroupState] = {}
 
     def all_hedges(self) -> list[HedgeGroupState]:
@@ -94,14 +101,60 @@ class HedgeCoordinator:
         HedgeStateMachine.assert_transition(group.state, HedgeState.PLANNING)
         group.state = HedgeState.PLANNING
 
+        # Pre-submit price re-check. Between scan (which may be on a ws push
+        # from ~10-100 ms ago, or worse on a REST poll several hundred ms
+        # stale) and submit, the book can move enough that the opportunity
+        # has collapsed — submitting on the stale prices guarantees bad fills.
+        # Reading the LATEST tops from OrderBookManager (which ws updates
+        # continuously) is ~free and costs us nothing on the happy path.
+        ref_buy_price = opp.buy_price
+        ref_sell_price = opp.sell_price
+        if self._books is not None:
+            latest_buy_book = self._books.get(opp.buy_exchange, opp.symbol)
+            latest_sell_book = self._books.get(opp.sell_exchange, opp.symbol)
+            if latest_buy_book is not None and latest_buy_book.best_ask is not None:
+                ref_buy_price = latest_buy_book.best_ask
+            if latest_sell_book is not None and latest_sell_book.best_bid is not None:
+                ref_sell_price = latest_sell_book.best_bid
+            # Abort if the edge evaporated. Gross spread must still cover
+            # fees + min_net_edge (in bps) after re-reading the book. This
+            # is CHEAPER than a fee-model lookup — we approximate the fee
+            # floor by the conservative buffer already baked into the
+            # opp's original edge calculation.
+            if ref_buy_price and ref_sell_price and ref_buy_price > 0:
+                fresh_gross_bps = (ref_sell_price - ref_buy_price) / ref_buy_price * Decimal("10000")
+                # Require the fresh gross spread to clear at least the same
+                # fee+buffer floor the scanner imposed. ``opp.net_edge_bps``
+                # already accounts for fees+buffer, and ``gross_spread_bps``
+                # was its pre-deduction sibling, so the delta of the two
+                # tells us how much margin we need to preserve.
+                min_required_gross = opp.gross_spread_bps - opp.net_edge_bps + self._settings.min_net_edge_bps
+                if fresh_gross_bps < min_required_gross:
+                    log.warning(
+                        "pre_submit_edge_collapsed",
+                        hedge_group_id=hid,
+                        symbol=opp.symbol,
+                        scan_gross_bps=str(opp.gross_spread_bps),
+                        fresh_gross_bps=str(fresh_gross_bps),
+                        required_bps=str(min_required_gross),
+                    )
+                    group.notes.append(
+                        f"pre_submit_edge_collapsed scan={opp.gross_spread_bps}bps "
+                        f"fresh={fresh_gross_bps}bps required={min_required_gross}bps"
+                    )
+                    HedgeStateMachine.assert_transition(group.state, HedgeState.ABORTED)
+                    group.state = HedgeState.ABORTED
+                    group.updated_at = utcnow()
+                    return group
+
         order_type = pick_order_type(self._settings)
         buy_price = (
-            protected_limit_price(self._settings, Side.BUY, opp.buy_price)
+            protected_limit_price(self._settings, Side.BUY, ref_buy_price)
             if order_type in (OrderType.IOC_LIMIT, OrderType.FOK_LIMIT, OrderType.LIMIT)
             else None
         )
         sell_price = (
-            protected_limit_price(self._settings, Side.SELL, opp.sell_price)
+            protected_limit_price(self._settings, Side.SELL, ref_sell_price)
             if order_type in (OrderType.IOC_LIMIT, OrderType.FOK_LIMIT, OrderType.LIMIT)
             else None
         )

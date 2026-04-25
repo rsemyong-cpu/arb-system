@@ -98,6 +98,7 @@ def _build_container(settings: Settings) -> Container:
         exposure,
         breaker=breaker,
         registry=registry,
+        book_mgr=book_mgr,
     )
     from app.execution.maker_taker_executor import MakerTakerExecutor
 
@@ -427,6 +428,10 @@ async def _scanner_loop(c: Container) -> None:
                         await _safe(c.opp_repo.save(opp, decision="accepted"))
                     # In dry-run we still go through execute so the full audit trail is produced.
                     if settings.mode in (_M.DRY_RUN.value, _M.PAPER_TRADE.value, _M.LIVE.value):
+                        # Set cooldown synchronously BEFORE spawning the task so
+                        # the next scan_once won't produce another opp for the
+                        # same symbol while this one is still submitting.
+                        c.risk.set_cooldown(opp.symbol)
                         # Route to maker-taker executor when that mode is selected
                         # AND we're not dry-run (maker-taker is runtime-only; dry
                         # run always goes through the audit path in hedge.execute
@@ -435,15 +440,21 @@ async def _scanner_loop(c: Container) -> None:
                             getattr(settings, "execution_mode", "taker_taker") == "maker_taker"
                             and settings.mode != _M.DRY_RUN.value
                         ):
-                            try:
-                                await c.maker_taker.execute(opp, decision.approved_amount)
-                            except Exception as e:  # noqa: BLE001
-                                log.error("maker_taker_exec_error", error=str(e))
+                            asyncio.create_task(
+                                _execute_maker_taker_safe(c, opp, decision.approved_amount),
+                                name=f"mt_exec_{opp.symbol}",
+                            )
                         else:
-                            group = await c.hedge.execute(opp, decision.approved_amount)
-                            if c.hedge_repo:
-                                await _safe(c.hedge_repo.upsert(group))
-                        c.risk.set_cooldown(opp.symbol)
+                            # Fire-and-forget: scanner keeps looking for new opps
+                            # while this hedge's 2x network submit + poll + any
+                            # repair runs concurrently. Blocking here (the prior
+                            # behavior) lost up to 50-75 scan cycles per trade on
+                            # a 10-15s-long hedge execution — enough for typical
+                            # sub-second cross-exchange windows to have closed.
+                            asyncio.create_task(
+                                _execute_hedge_safe(c, opp, decision.approved_amount),
+                                name=f"hedge_exec_{opp.symbol}",
+                            )
                 else:
                     opp.decision = "rejected"
                     opp.decision_reason = decision.reason.value if decision.reason else "unknown"
@@ -464,6 +475,30 @@ async def _safe(coro) -> None:
         await coro
     except Exception as e:  # noqa: BLE001
         log.warning("persistence_error", error=str(e))
+
+
+async def _execute_hedge_safe(c: Container, opp, approved_amount) -> None:
+    """Background hedge execution. Runs in its own task so the scanner loop
+    can keep polling while this hedge's network submissions + settlement
+    poll + any repair attempt complete (10-15s worst case per hedge).
+    All errors are caught so a buggy task can't bring down the scheduler.
+    """
+    try:
+        group = await c.hedge.execute(opp, approved_amount)
+        if c.hedge_repo:
+            await _safe(c.hedge_repo.upsert(group))
+    except Exception as e:  # noqa: BLE001
+        log.error("hedge_exec_error", symbol=opp.symbol, error=str(e))
+
+
+async def _execute_maker_taker_safe(c: Container, opp, approved_amount) -> None:
+    """Background maker-taker execution. Same safety contract as
+    ``_execute_hedge_safe``.
+    """
+    try:
+        await c.maker_taker.execute(opp, approved_amount)
+    except Exception as e:  # noqa: BLE001
+        log.error("maker_taker_exec_error", symbol=opp.symbol, error=str(e))
 
 
 async def teardown(c: Container) -> None:
